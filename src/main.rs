@@ -18,6 +18,7 @@ mod gpu_decode;
 mod gpu_monitor;
 mod logger;
 mod overlay;
+mod paths;
 mod recovery;
 mod render;
 mod settings;
@@ -823,10 +824,7 @@ impl ApplicationHandler<AppEvent> for App {
                             nominal_fps: nominal_fps(&self.settings.fps_mode),
                             framegen_settings: framegen_settings_json(&self.settings),
                         };
-                        let base = std::env::current_exe()
-                            .ok()
-                            .and_then(|p| p.parent().map(|d| d.join("recordings")))
-                            .unwrap_or_else(|| "recordings".into());
+                        let base = paths::recordings_dir();
                         self.recorder
                             .start(&base, Duration::from_secs(10), info, Instant::now());
                     }

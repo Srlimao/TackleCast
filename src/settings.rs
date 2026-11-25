@@ -1,6 +1,6 @@
 use std::fmt::{Display, Formatter};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -552,8 +552,18 @@ impl Settings {
     }
 
     pub fn load() -> Self {
-        let path = settings_path();
-        let Ok(raw) = fs::read_to_string(path) else {
+        Self::load_from_paths(&settings_path(), &crate::paths::portable_settings_path())
+    }
+
+    fn load_from_paths(active: &Path, portable_seed: &Path) -> Self {
+        let raw = fs::read_to_string(active).or_else(|err| {
+            if active != portable_seed {
+                fs::read_to_string(portable_seed)
+            } else {
+                Err(err)
+            }
+        });
+        let Ok(raw) = raw else {
             return Self::default();
         };
 
@@ -563,7 +573,10 @@ impl Settings {
     }
 
     pub fn save(&self) -> std::io::Result<()> {
-        let path = settings_path();
+        self.save_to_path(&settings_path())
+    }
+
+    fn save_to_path(&self, path: &Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -672,18 +685,7 @@ pub fn get_capture_config(
 }
 
 pub fn settings_path() -> PathBuf {
-    let mut base = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(PathBuf::from))
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-
-    if cfg!(debug_assertions) {
-        if let Ok(current_dir) = std::env::current_dir() {
-            base = current_dir;
-        }
-    }
-
-    base.join("tacklecast_settings.json")
+    crate::paths::settings_path()
 }
 
 fn default_true() -> bool {
@@ -1078,5 +1080,40 @@ mod tests {
         assert_eq!(s.volume, 0.5);
         let s: Settings = serde_json::from_str(r#"{"framegen_rife_model":"4.6_half"}"#).unwrap();
         assert_eq!(s.framegen_rife_model, RifeModel::V46Half);
+    }
+
+    #[test]
+    fn load_falls_back_to_portable_seed_and_prefers_saved_user_settings() {
+        let root = std::env::temp_dir().join(format!(
+            "tacklecast-settings-fallback-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let active = root.join("appdata").join("tacklecast_settings.json");
+        let seed = root.join("portable").join("tacklecast_settings.json");
+
+        let seed_settings = Settings {
+            volume: 0.35,
+            theme: Theme::Classic,
+            ..Settings::default()
+        };
+        seed_settings.save_to_path(&seed).unwrap();
+
+        let initial = Settings::load_from_paths(&active, &seed);
+        assert_eq!(initial.volume, 0.35);
+        assert_eq!(initial.theme, Theme::Classic);
+
+        let updated = Settings {
+            volume: 0.85,
+            theme: Theme::Vice,
+            ..Settings::default()
+        };
+        updated.save_to_path(&active).unwrap();
+
+        let reloaded = Settings::load_from_paths(&active, &seed);
+        assert_eq!(reloaded.volume, 0.85);
+        assert_eq!(reloaded.theme, Theme::Vice);
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
