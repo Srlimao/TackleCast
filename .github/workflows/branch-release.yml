@@ -7,7 +7,7 @@ on:
         description: Branch, tag, or commit in Srlimao/TackleCast to build
         required: true
         type: string
-        default: main
+        default: fork/branch-release
       version:
         description: Optional vMAJOR.MINOR.PATCH version (blank = auto next vMAJOR.MINOR.100+)
         required: false
