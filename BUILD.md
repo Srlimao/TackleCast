@@ -360,3 +360,15 @@ in `release-assets/`. Each checksum file uses the standard
 key), `TACKLECAST_SIGN_REPO`, and `TACKLECAST_SIGN_TAG` set. The script requires
 Python 3.11 or later and OpenSSL 3. Attach the archives, checksums, and generated
 `.sha256.sig` files to the draft GitHub release before publishing it.
+
+## Settings, logs, and read-only install directories
+
+By default, TackleCast keeps `tacklecast_settings.json`, `logs/`, and diagnostic
+`recordings/` portable next to the executable (or in the working directory for
+debug builds). On startup, `paths::data_dir()` probes whether that directory is
+writable; if creation fails (for example, when installed inside `Program Files`
+without administrator privileges), it falls back to `%APPDATA%\TackleCast`
+(or `%LOCALAPPDATA%\TackleCast`) on Windows and `$XDG_CONFIG_HOME/tacklecast`
+(`~/.config/tacklecast`) on Linux. Any pre-existing `tacklecast_settings.json`
+next to a read-only executable is still loaded as initial defaults until saved
+to the user data directory.

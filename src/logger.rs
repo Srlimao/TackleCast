@@ -1,5 +1,5 @@
 use std::fs::{self, File};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::OnceLock;
 
 use time::macros::format_description;
@@ -13,7 +13,7 @@ use tracing_subscriber::{EnvFilter, Layer};
 static LOG_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
 
 pub fn init_logging() -> Result<(), Box<dyn std::error::Error>> {
-    let logs_dir = logs_dir();
+    let logs_dir = crate::paths::logs_dir();
     fs::create_dir_all(&logs_dir)?;
     prune_old_logs(&logs_dir)?;
 
@@ -95,18 +95,4 @@ fn prune_old_logs(logs_dir: &Path) -> std::io::Result<()> {
     }
 
     Ok(())
-}
-
-fn logs_dir() -> PathBuf {
-    if cfg!(debug_assertions) {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join("logs")
-    } else {
-        std::env::current_exe()
-            .ok()
-            .and_then(|path| path.parent().map(PathBuf::from))
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("logs")
-    }
 }
