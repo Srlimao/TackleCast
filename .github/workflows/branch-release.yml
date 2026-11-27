@@ -8,18 +8,23 @@ on:
         required: true
         type: string
         default: main
+      version:
+        description: Optional vMAJOR.MINOR.PATCH version (blank = auto next vMAJOR.MINOR.100+)
+        required: false
+        type: string
+        default: ''
       run_checks:
         description: Run formatting, unit tests, and Clippy before packaging
         required: false
         type: boolean
         default: false
       publish:
-        description: Publish/update the rolling branch-preview GitHub Pre-release
+        description: Publish as the latest GitHub Release on Srlimao/TackleCast
         required: false
         type: boolean
         default: true
       release_notes:
-        description: Optional note placed at the top of the pre-release description
+        description: Optional note placed at the top of the release description
         required: false
         type: string
         default: ''
@@ -28,12 +33,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: branch-release-preview
+  group: branch-release-fork
   cancel-in-progress: false
 
 jobs:
   resolve:
-    name: Resolve target ref
+    name: Resolve target ref & version
     if: github.repository == 'Srlimao/TackleCast'
     runs-on: ubuntu-24.04
     outputs:
@@ -41,6 +46,7 @@ jobs:
       short_sha: ${{ steps.ref.outputs.short_sha }}
       ref_name: ${{ steps.ref.outputs.ref_name }}
       version: ${{ steps.ref.outputs.version }}
+      tag: ${{ steps.ref.outputs.tag }}
       commit_subject: ${{ steps.ref.outputs.commit_subject }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -50,9 +56,11 @@ jobs:
       - id: ref
         env:
           TARGET_REF: ${{ inputs.branch }}
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           python3 - <<'PY'
           import os
+          import re
           import subprocess
           import tomllib
           import uuid
@@ -76,7 +84,45 @@ jobs:
               raise SystemExit(f'Could not resolve ref {ref!r} to a commit in this repository')
 
           manifest = subprocess.check_output(['git', 'show', f'{commit}:Cargo.toml'], text=True)
-          version = str(tomllib.loads(manifest)['package']['version'])
+          raw_cargo_ver = str(tomllib.loads(manifest)['package']['version']).strip()
+          m_cargo = re.fullmatch(r'(\d+)\.(\d+)\.(\d+)', raw_cargo_ver)
+          if not m_cargo:
+              raise SystemExit(f'Expected strict MAJOR.MINOR.PATCH in Cargo.toml, got {raw_cargo_ver!r}')
+          cargo_ver = tuple(int(part) for part in m_cargo.groups())
+
+          all_tags = subprocess.check_output(['git', 'tag', '-l'], text=True).splitlines()
+          tag_vers = []
+          for existing in all_tags:
+              m_tag = re.fullmatch(r'v(\d+)\.(\d+)\.(\d+)', existing.strip())
+              if m_tag:
+                  tag_vers.append(tuple(int(part) for part in m_tag.groups()))
+
+          requested = os.environ['INPUT_VERSION'].strip()
+          if requested:
+              normalized = requested[1:] if requested.startswith('v') else requested
+              m_req = re.fullmatch(r'(\d+)\.(\d+)\.(\d+)', normalized)
+              if not m_req:
+                  raise SystemExit(f'Expected strict MAJOR.MINOR.PATCH (or vMAJOR.MINOR.PATCH), got {requested!r}')
+              version = normalized
+              tag = f'v{version}'
+              exists = subprocess.run(
+                  ['git', 'rev-parse', '--verify', '--quiet', f'refs/tags/{tag}'],
+                  capture_output=True,
+              )
+              if exists.returncode == 0:
+                  raise SystemExit(f'Tag {tag} already exists')
+          else:
+              base = max([cargo_ver, *tag_vers])
+              next_ver = (base[0], base[1], max(base[2] + 1, 100))
+              version = f'{next_ver[0]}.{next_ver[1]}.{next_ver[2]}'
+              tag = f'v{version}'
+              exists = subprocess.run(
+                  ['git', 'rev-parse', '--verify', '--quiet', f'refs/tags/{tag}'],
+                  capture_output=True,
+              )
+              if exists.returncode == 0:
+                  raise SystemExit(f'Auto-computed tag {tag} already exists')
+
           subject = subprocess.check_output(['git', 'log', '-1', '--format=%s', commit], text=True)
           subject = subject.replace('\r', ' ').replace('\n', ' ').strip()
 
@@ -88,6 +134,7 @@ jobs:
               output.write(f'commit={commit}\n')
               output.write(f'short_sha={commit[:7]}\n')
               output.write(f'version={version}\n')
+              output.write(f'tag={tag}\n')
               write_multiline(output, 'ref_name', ref)
               write_multiline(output, 'commit_subject', subject)
           PY
@@ -136,16 +183,66 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Model build dependencies failed' }
           python scripts/setup_framegen.py
           if ($LASTEXITCODE -ne 0) { throw 'Pinned frame-generation preparation failed' }
+      - name: Stamp preview version in Cargo.toml and Cargo.lock
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import tomllib
+
+          new_version = os.environ['RELEASE_VERSION']
+
+          with open('Cargo.toml', 'r', encoding='utf-8', newline='') as f:
+              cargo_toml = f.read()
+          stamped_toml, toml_count = re.subn(
+              r'(\[package\]\r?\n(?:(?!\[)[^\n]*\n)*?version\s*=\s*")[^"]+(")',
+              rf'\g<1>{new_version}\2',
+              cargo_toml,
+              count=1,
+          )
+          if toml_count != 1:
+              raise SystemExit(f'Expected 1 Cargo.toml version replacement, got {toml_count}')
+          if tomllib.loads(stamped_toml)['package']['version'] != new_version:
+              raise SystemExit('Cargo.toml stamped version verification failed')
+          with open('Cargo.toml', 'w', encoding='utf-8', newline='') as f:
+              f.write(stamped_toml)
+
+          with open('Cargo.lock', 'r', encoding='utf-8', newline='') as f:
+              cargo_lock = f.read()
+          stamped_lock, lock_count = re.subn(
+              r'(\[\[package\]\]\r?\nname = "tacklecast"\r?\nversion = ")[^"]+(")',
+              rf'\g<1>{new_version}\2',
+              cargo_lock,
+              count=1,
+          )
+          if lock_count != 1:
+              raise SystemExit(f'Expected 1 Cargo.lock version replacement, got {lock_count}')
+          with open('Cargo.lock', 'w', encoding='utf-8', newline='') as f:
+              f.write(stamped_lock)
+          PY
       - name: Windows package
         shell: powershell
         env:
           BUILD_COMMIT: ${{ needs.resolve.outputs.commit }}
+          RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
+          TACKLECAST_UPDATE_REPO: ${{ github.repository }}
+          TACKLECAST_UPDATE_PUBLIC_KEY: ${{ vars.TACKLECAST_UPDATE_PUBLIC_KEY || secrets.TACKLECAST_UPDATE_PUBLIC_KEY }}
         run: |
+          if ([string]::IsNullOrWhiteSpace($env:TACKLECAST_UPDATE_PUBLIC_KEY)) {
+            Remove-Item Env:TACKLECAST_UPDATE_PUBLIC_KEY -ErrorAction SilentlyContinue
+          }
           .\scripts\package_rust_release.ps1 -PackageName TackleCast-Windows-x86_64 -RequireGpuDlls -RequireFrameGen -Zip
           if ($LASTEXITCODE -ne 0) { throw 'Windows packaging failed' }
           Expand-Archive dist/TackleCast-Windows-x86_64.zip -DestinationPath dist/extracted-windows
           python scripts/verify_package.py --package dist/extracted-windows --require-gpu --require-framegen --commit $env:BUILD_COMMIT
           if ($LASTEXITCODE -ne 0) { throw 'Package verification failed' }
+          $buildInfo = Get-Content dist/extracted-windows/build-info.json -Raw | ConvertFrom-Json
+          if ($buildInfo.version -ne $env:RELEASE_VERSION) {
+            throw "build-info.json version '$($buildInfo.version)' != '$($env:RELEASE_VERSION)'"
+          }
           python scripts/smoke_test.py --binary dist/extracted-windows/TackleCast.exe
           if ($LASTEXITCODE -ne 0) { throw 'Synthetic rendering failed' }
       - name: Archive checksum
@@ -167,7 +264,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    name: Update Branch Preview pre-release
+    name: Publish fork release
     if: github.repository == 'Srlimao/TackleCast' && inputs.publish
     needs: [resolve, build]
     runs-on: ubuntu-24.04
@@ -178,29 +275,78 @@ jobs:
         with:
           path: release-assets
           merge-multiple: true
-      - name: Point branch-preview tag to built commit
+      - name: Sign Windows update checksum (optional)
+        id: sign
         env:
-          GH_TOKEN: ${{ github.token }}
-          COMMIT: ${{ needs.resolve.outputs.commit }}
-          TAG_NAME: branch-preview
+          TACKLECAST_UPDATE_PUBLIC_KEY: ${{ vars.TACKLECAST_UPDATE_PUBLIC_KEY || secrets.TACKLECAST_UPDATE_PUBLIC_KEY }}
+          TACKLECAST_UPDATE_SIGNING_KEY: ${{ secrets.TACKLECAST_UPDATE_SIGNING_KEY }}
+          SIGN_REPO: ${{ github.repository }}
+          SIGN_TAG: ${{ needs.resolve.outputs.tag }}
         run: |
-          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG_NAME}" >/dev/null 2>&1; then
-            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG_NAME}" \
-              -f sha="${COMMIT}" \
-              -F force=true
-          else
-            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
-              -f ref="refs/tags/${TAG_NAME}" \
-              -f sha="${COMMIT}"
-          fi
-      - name: Generate pre-release notes
+          python3 - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          from tempfile import TemporaryDirectory
+
+          public_key = os.environ.get('TACKLECAST_UPDATE_PUBLIC_KEY', '').strip()
+          private_key = os.environ.get('TACKLECAST_UPDATE_SIGNING_KEY', '').strip()
+          repo = os.environ['SIGN_REPO'].strip()
+          tag = os.environ['SIGN_TAG'].strip()
+          archive = 'TackleCast-Windows-x86_64.zip'
+          ed25519_spki = bytes.fromhex('302a300506032b6570032100')
+
+          if not public_key and not private_key:
+              print('No update signing key configured; in-app updater will open the GitHub release page.')
+              with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as out:
+                  out.write('signed=false\n')
+              raise SystemExit(0)
+
+          if not re.fullmatch(r'[a-fA-F0-9]{64}', public_key) or not private_key:
+              raise SystemExit('Configure both TACKLECAST_UPDATE_PUBLIC_KEY (64 hex chars) and TACKLECAST_UPDATE_SIGNING_KEY')
+
+          assets = Path('release-assets')
+          archive_path = assets / archive
+          checksum_path = assets / f'{archive}.sha256'
+          with archive_path.open('rb') as stream:
+              digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+          if checksum_path.read_text(encoding='ascii').split() != [digest, archive]:
+              raise SystemExit(f'Checksum does not match {archive}')
+
+          with TemporaryDirectory(prefix='tacklecast-sign-') as tmp:
+              key = Path(tmp) / 'key.pem'
+              key.write_text(private_key + '\n', encoding='ascii')
+              os.chmod(key, 0o600)
+              public_der = subprocess.check_output(['openssl', 'pkey', '-in', key, '-pubout', '-outform', 'DER'])
+              if public_der != ed25519_spki + bytes.fromhex(public_key):
+                  raise SystemExit('TACKLECAST_UPDATE_SIGNING_KEY does not match TACKLECAST_UPDATE_PUBLIC_KEY')
+              message = Path(tmp) / 'message'
+              message.write_bytes(
+                  f'tacklecast-update-v1\n{repo.lower()}\n{tag}\n{archive}\n{digest}\n'.encode('ascii')
+              )
+              sig_path = checksum_path.with_suffix('.sha256.sig')
+              subprocess.run(
+                  ['openssl', 'pkeyutl', '-sign', '-rawin', '-inkey', key, '-in', message, '-out', sig_path],
+                  check=True,
+              )
+              if sig_path.stat().st_size != 64:
+                  raise SystemExit(f'Expected 64-byte Ed25519 signature, got {sig_path.stat().st_size}')
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as out:
+              out.write('signed=true\n')
+          PY
+      - name: Generate release notes
         env:
           REF_NAME: ${{ needs.resolve.outputs.ref_name }}
           COMMIT: ${{ needs.resolve.outputs.commit }}
           SHORT_SHA: ${{ needs.resolve.outputs.short_sha }}
           VERSION: ${{ needs.resolve.outputs.version }}
+          TAG: ${{ needs.resolve.outputs.tag }}
           COMMIT_SUBJECT: ${{ needs.resolve.outputs.commit_subject }}
           RELEASE_NOTES: ${{ inputs.release_notes }}
+          SIGNED: ${{ steps.sign.outputs.signed }}
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
           python3 - <<'PY'
@@ -213,28 +359,37 @@ jobs:
           commit = os.environ['COMMIT']
           short_sha = os.environ['SHORT_SHA']
           version = os.environ['VERSION']
+          tag = os.environ['TAG']
           subject = os.environ['COMMIT_SUBJECT']
           notes = os.environ['RELEASE_NOTES'].strip()
+          signed = os.environ['SIGNED'] == 'true'
           run_id = os.environ['GITHUB_RUN_ID']
           built_at = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+
+          updater_status = (
+              'Enabled (Ed25519 signed; 1-click in-app updates enabled)'
+              if signed
+              else 'Manual fallback (unsigned; app detects updates and opens this release page)'
+          )
 
           lines = []
           if notes:
               lines.extend([notes, ''])
 
           lines.extend([
-              f'Rolling Windows preview build from `{repo}`.',
+              f'Windows preview release from fork `{repo}`.',
               '',
+              f'- **Version / Tag:** `{version}` (`{tag}`)',
               f'- **Branch / Ref:** `{ref_name}`',
               f'- **Commit:** [`{short_sha}`](https://github.com/{repo}/commit/{commit}) (`{commit}`)',
               f'- **Message:** {subject}',
-              f'- **Cargo version:** `{version}`',
+              f'- **Auto-updater:** {updater_status}',
               f'- **Built at:** {built_at}',
               f'- **Workflow run:** https://github.com/{repo}/actions/runs/{run_id}',
               '',
               '### Quick Start (Windows x86_64)',
               '1. Download `TackleCast-Windows-x86_64.zip` below.',
-              '2. Extract the entire archive into a folder.',
+              '2. Extract the entire archive into a writable folder.',
               '3. Run `TackleCast.exe`.',
           ])
 
@@ -242,10 +397,10 @@ jobs:
           PY
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          tag_name: branch-preview
+          tag_name: ${{ needs.resolve.outputs.tag }}
           target_commitish: ${{ needs.resolve.outputs.commit }}
-          name: Branch Preview (${{ needs.resolve.outputs.ref_name }} @ ${{ needs.resolve.outputs.short_sha }})
+          name: ${{ needs.resolve.outputs.tag }} (${{ needs.resolve.outputs.ref_name }} @ ${{ needs.resolve.outputs.short_sha }})
           body_path: release-body.md
           files: release-assets/*
           fail_on_unmatched_files: true
-          prerelease: true
+          prerelease: false
